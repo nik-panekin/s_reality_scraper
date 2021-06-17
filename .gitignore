@@ -1,3 +1,12 @@
 __pycache__/
+img/
+json/
+logs/
 venv/
-activate.bat
+_dev/
+*.bat
+*.bak
+*.csv
+*.sh
+crontab
+last_processed_page.txt
