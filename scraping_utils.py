@@ -80,7 +80,7 @@ def setup_logging():
         try:
             os.mkdir(LOG_FOLDER)
         except OSError:
-            logging.warning('Не удалось создать папку для журнала ошибок.')
+            logging.warning('Can\'t create log folder.')
 
     if os.path.exists(LOG_FOLDER):
         fileHandler = logging.handlers.RotatingFileHandler(
@@ -107,7 +107,7 @@ def get_response(url: str, params: dict=None) -> requests.Response:
                 return None
             return r
 
-    logging.error(f'Error: can\'t execute HTTP request while accessing {url}.')
+    logging.error(f'Can\'t execute HTTP request while accessing {url}.')
     return None
 
 # Retrieve an image from URL and save it to a file
@@ -118,10 +118,10 @@ def save_image(url: str, filename: str) -> bool:
         with open(filename, 'wb') as f:
             f.write(r.content)
     except OSError:
-        logging.error('Error: can\'t save an image to the disk.')
+        logging.error('Can\'t save an image to the disk.')
         return False
     except Exception as e:
-        logging.error('Error while retrieving an image from URL: ' + str(e))
+        logging.error('Failure while retrieving an image from URL: ' + str(e))
         return False
 
     return True

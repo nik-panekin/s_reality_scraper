@@ -1,3 +1,11 @@
+f"""The main script to be run.
+
+This program scrapes the real estate objects information (text and photos) from
+the https://www.sreality.cz/ server.
+
+Initial search page:
+    https://www.sreality.cz/hledani/prodej/byty/praha?bez-aukce=1
+"""
 import re
 import os
 import os.path
@@ -13,6 +21,7 @@ from datetime import datetime
 from signal import signal, SIGINT
 
 import requests
+from PIL import Image
 
 from scraping_utils import (fix_filename, remove_umlauts, setup_logging,
                             get_response, save_image, get_ip, USE_TOR,
@@ -47,6 +56,7 @@ Options for build command:
 Use CTRL-C to interrupt the script execution.
 """
 
+# User must input this string in order to execute image folder cleaning
 VACUUM_CONFIRM = 'ok'
 
 BASE_URL = 'https://www.sreality.cz/'
@@ -55,12 +65,15 @@ ITEM_BASE_URL = BASE_URL + 'detail/prodej/byt/'
 
 JSON_URL = BASE_URL + 'api/cs/v2/estates'
 
+# This is the maximum amount of items per page in API calls
 ITEMS_PER_PAGE = 60
 
+# Filename containing scraping progress
 LAST_PROCESSED_PAGE_FILENAME = 'last_processed_page.txt'
 
 # Item name example: 'Prodej bytu 2+1 83 m²'
 #                    'Prodej bytu 6 pokojů a více 276 m² (Mezonet)'
+# Is used for building item link
 ESTATE_TYPE_RE = re.compile(r'^Prodej bytu (.+)\s\d+\sm²')
 
 REMOVED_MARK = 'removed'
@@ -73,6 +86,10 @@ BACKUP_FILENAME = CSV_FILENAME + '.bak'
 
 IMAGE_DIR = 'img'
 
+# Trimming values for removing "sreality.cz" watermark
+CROP_TOP = 43
+CROP_LEFT = 187
+
 JSON_DIR = 'json'
 
 COLUMNS = [
@@ -84,7 +101,7 @@ COLUMNS = [
     'Цена',
     'Описание',
 
-    # Table data begin
+    # Table section begin
     'Celková cena',
     'ID zakázky',
     'Aktualizace',
@@ -140,7 +157,7 @@ COLUMNS = [
     'Původní cena',
     'Bazén',
     'Minimální kupní cena',
-    # Table data end
+    # Table section end
 
     'Геопозиция широта',
     'Геопозиция долгота',
@@ -175,10 +192,12 @@ def load_last_page() -> int:
                             'is currupted.')
     return page
 
+# Returns UNIX timestamp
 def get_tms():
     return int(time.time() * 1000)
 
 # Getting all the estates for a category via API GET request as JSON dictionary
+# If today parameter is set to True, then returns only new items
 def get_category_json(page: int=1, today: bool=False) -> dict:
     params = {
         'category_main_cb': 1,
@@ -205,6 +224,7 @@ def get_category_json(page: int=1, today: bool=False) -> dict:
 
     return json
 
+# Getting item JSON dictionary for specified item hash_id via API GET request
 def get_item_json(hash_id: int) -> dict:
     params = {
         'tms': get_tms(),
@@ -222,6 +242,7 @@ def get_item_json(hash_id: int) -> dict:
 
     return json
 
+# Extracting item address parts from item data JSON dictionary
 def get_item_address(item_json: dict) -> dict:
     # Full address example: 'Karla Engliše, Praha 5 - Smíchov'
     addr_str = item_json['locality']['value']
@@ -243,6 +264,7 @@ def get_item_address(item_json: dict) -> dict:
 
     return address
 
+# Building item link from item data JSON dictionary and item hash_id
 def get_item_link(item_json: dict, hash_id: int) -> str:
     address = get_item_address(item_json)
     # CEO keywords examples:
@@ -266,116 +288,8 @@ def get_item_link(item_json: dict, hash_id: int) -> str:
 
     return item_link
 
-def scrape_hash_ids() -> list:
-    hash_ids = []
-
-    page_count = get_page_count()
-    if page_count == None:
-        return None
-
-    logging.info(f'Total page count to iterate: {page_count}')
-    for page in range(1, page_count + 1):
-        logging.info(f'Iterating through page {page} of {page_count}.')
-        estates = get_category_json(page)['_embedded']['estates']
-        if estates == None:
-            return None
-
-        hash_ids.extend([estate['hash_id'] for estate in estates
-                         if estate['hash_id'] not in hash_ids])
-
-    return hash_ids
-
-def check_item(hash_id: int, hash_ids: list) -> bool:
-    if hash_id in hash_ids:
-        return True
-
-    # Additional check just to be sure
-    if get_item_json(hash_id) == None:
-        return False
-
-    return True
-
-def check_items() -> bool:
-    logging.info('Rertieving hash_ids for all actual items.')
-    hash_ids = scrape_hash_ids()
-    if hash_ids == None:
-        return False
-
-    logging.info('Iterating through all scraped items.')
-    marked_item_count = 0
-    items = load_items(CSV_FILENAME)
-    for index, item in enumerate(items):
-        hash_id = hash_id_from_link(item['Ссылка'])
-        if not check_item(hash_id, hash_ids):
-            logging.info(f'Setting "{REMOVED_MARK}" mark, '
-                         + f'item hash_id: {hash_id}.')
-            items[index]['Удалено'] = REMOVED_MARK
-            marked_item_count += 1
-
-    if not save_items(items, CSV_FILENAME):
-        return False
-
-    logging.info(f'File {CSV_FILENAME} was successfully updated. '
-                 f'Outdated item count: {marked_item_count}.')
-
-    return True
-
-def clean_csv() -> bool:
-    deleted_item_count = 0
-    items = load_items(CSV_FILENAME)
-    for i in range(len(items) - 1, -1, -1):
-        if items[i]['Удалено'] == REMOVED_MARK:
-            hash_id = hash_id_from_link(items[i]['Ссылка'])
-            logging.info(f'Removing item from {CSV_FILENAME}, '
-                         + f'hash_id: {hash_id}.')
-            del items[i]
-            deleted_item_count += 1
-
-    if not save_items(items, CSV_FILENAME):
-        return False
-
-    logging.info(f'File {CSV_FILENAME} was successfully updated. '
-                 f'Items removed: {deleted_item_count}.')
-
-    return True
-
-def clean_files():
-    items = load_items(CSV_FILENAME)
-    hash_ids = get_hash_ids(items)
-
-    logging.info('Cleaning JSON files.')
-    json_filelist = glob.glob(os.path.join(JSON_DIR, '*.json'))
-    deleted_json_files = 0
-    for filename in json_filelist:
-        if hash_id_from_json_name(filename) not in hash_ids:
-            logging.info(f'Deleting JSON file {filename}')
-            try:
-                os.remove(filename)
-            except OSError:
-                logging.error(f'File {filename} deleting failure.')
-            else:
-                deleted_json_files += 1
-
-    logging.info(f'Total JSON files deleted: {deleted_json_files}.')
-
-    logging.info('Cleaning image folder.')
-    valid_dirlist = get_image_folders(items)
-    images_dirlist = [os.path.join(IMAGE_DIR, image_folder)
-                      for image_folder in os.listdir(IMAGE_DIR)]
-    deleted_image_folders = 0
-    # Deleting images with 'broken links' as well as duplicates
-    for image_folder in images_dirlist:
-        if image_folder not in valid_dirlist:
-            logging.info(f'Deleting image folder {image_folder}')
-            try:
-                shutil.rmtree(image_folder)
-            except OSError:
-                logging.error(f'Folder {image_folder} deleting failure.')
-            else:
-                deleted_image_folders += 1
-
-    logging.info(f'Total image folders deleted: {deleted_image_folders}.')
-
+# Returns a dict for a given item data JSON and item hash_id with all nessesary
+# fields for immediate insertion to the CVS database
 def get_item(item_json: dict, hash_id: int) -> dict:
     item = {}
     for key in COLUMNS:
@@ -479,14 +393,9 @@ def get_item(item_json: dict, hash_id: int) -> dict:
 
     return item
 
-def get_page_count(today: bool=False) -> int:
-    search_result = get_category_json(today=today)
-    if search_result:
-        return ceil(search_result['result_size'] / ITEMS_PER_PAGE)
-    else:
-        return None
-
-# Saving item data to a CSV file
+# Saving prepared item data to a CSV file
+# If first_item is set to True, then recreates the CSV database
+# If first_item is set to False, then just appends a new row
 def save_item(item: dict, filename: str, first_item=False) -> bool:
     try:
         with open(filename, 'w' if first_item else 'a',
@@ -504,6 +413,7 @@ def save_item(item: dict, filename: str, first_item=False) -> bool:
 
     return True
 
+# Saves prepared items list to a CSV file
 def save_items(items: list, filename: str) -> bool:
     for index, item in enumerate(items):
         if not save_item(item, filename, first_item = (index == 0)):
@@ -511,35 +421,7 @@ def save_items(items: list, filename: str) -> bool:
 
     return True
 
-def save_item_images(item_json: dict, hash_id: int,
-                     use_cache: bool=False) -> bool:
-    image_folder_path = get_image_folder(get_item_link(item_json, hash_id))
-    if not os.path.exists(image_folder_path):
-        try:
-            os.mkdir(image_folder_path)
-        except OSError:
-            logging.error(f'Can\'t create images folder {image_folder_path}')
-            return False
-
-    result = True
-    for img_ind, image in enumerate(item_json['_embedded']['images']):
-        href = image['_links']['view']['href']
-        logging.info(f'Saving image from {href}')
-        img_ind_str = str(img_ind)
-        img_ind_str = '0' * (3 - len(img_ind_str)) + img_ind_str
-        image_filename = f'{hash_id}_{img_ind_str}.jpg'
-        image_full_path = os.path.join(image_folder_path, image_filename)
-
-        # Checking if the image has already downloaded
-        if use_cache and os.path.exists(image_full_path):
-            logging.info(f'Image cache found: {image_filename}')
-        else:
-            if not save_image(href, image_full_path):
-                result = False
-
-    return result
-
-# Loads from CVS
+# Loads real estate items list from a CVS file
 def load_items(filename: str) -> list:
     if not os.path.exists(filename):
         return []
@@ -562,25 +444,218 @@ def load_items(filename: str) -> list:
 
     return items
 
+# Returns total page count for the real estate item search via site API
+def get_page_count(today: bool=False) -> int:
+    search_result = get_category_json(today=today)
+    if search_result:
+        return ceil(search_result['result_size'] / ITEMS_PER_PAGE)
+    else:
+        return None
+
+# Returns the hash_id list for all the real estate items from the site
+def scrape_hash_ids() -> list:
+    hash_ids = []
+
+    page_count = get_page_count()
+    if page_count == None:
+        return None
+
+    logging.info(f'Total page count to iterate: {page_count}')
+    for page in range(1, page_count + 1):
+        logging.info(f'Iterating through page {page} of {page_count}.')
+        estates = get_category_json(page)['_embedded']['estates']
+        if estates == None:
+            return None
+
+        hash_ids.extend([estate['hash_id'] for estate in estates
+                         if estate['hash_id'] not in hash_ids])
+
+    return hash_ids
+
+# Checks whether a real estate item with hash_id is available on the site
+# The hash_ids list contains all the available item identifiers from the site
+def check_item(hash_id: int, hash_ids: list) -> bool:
+    if hash_id in hash_ids:
+        return True
+
+    # Additional check just to be sure
+    if get_item_json(hash_id) == None:
+        return False
+
+    return True
+
+# Checks site availability for all the real estate items in the CSV database
+def check_items() -> bool:
+    logging.info('Rertieving hash_ids for all actual items.')
+    hash_ids = scrape_hash_ids()
+    if hash_ids == None:
+        return False
+
+    logging.info('Iterating through all scraped items.')
+    marked_item_count = 0
+    items = load_items(CSV_FILENAME)
+    for index, item in enumerate(items):
+        hash_id = hash_id_from_link(item['Ссылка'])
+        if not check_item(hash_id, hash_ids):
+            logging.info(f'Setting "{REMOVED_MARK}" mark, '
+                         + f'item hash_id: {hash_id}.')
+            items[index]['Удалено'] = REMOVED_MARK
+            marked_item_count += 1
+
+    if not save_items(items, CSV_FILENAME):
+        return False
+
+    logging.info(f'File {CSV_FILENAME} was successfully updated. '
+                 f'Outdated item count: {marked_item_count}.')
+
+    return True
+
+# Deletes marked as 'removed' rows in the CSV database
+def clean_csv() -> bool:
+    deleted_item_count = 0
+    items = load_items(CSV_FILENAME)
+    for i in range(len(items) - 1, -1, -1):
+        if items[i]['Удалено'] == REMOVED_MARK:
+            hash_id = hash_id_from_link(items[i]['Ссылка'])
+            logging.info(f'Removing item from {CSV_FILENAME}, '
+                         + f'hash_id: {hash_id}.')
+            del items[i]
+            deleted_item_count += 1
+
+    if not save_items(items, CSV_FILENAME):
+        return False
+
+    logging.info(f'File {CSV_FILENAME} was successfully updated. '
+                 f'Items removed: {deleted_item_count}.')
+
+    return True
+
+# Removes all the images and json files having no actual link to a real estate
+# item in the CSV database
+def clean_files():
+    items = load_items(CSV_FILENAME)
+    hash_ids = get_hash_ids(items)
+
+    logging.info('Cleaning JSON files.')
+    json_filelist = glob.glob(os.path.join(JSON_DIR, '*.json'))
+    deleted_json_files = 0
+    for filename in json_filelist:
+        if hash_id_from_json_name(filename) not in hash_ids:
+            logging.info(f'Deleting JSON file {filename}')
+            try:
+                os.remove(filename)
+            except OSError:
+                logging.error(f'File {filename} deleting failure.')
+            else:
+                deleted_json_files += 1
+
+    logging.info(f'Total JSON files deleted: {deleted_json_files}.')
+
+    logging.info('Cleaning image folder.')
+    valid_dirlist = get_image_folders(items)
+    images_dirlist = [os.path.join(IMAGE_DIR, image_folder)
+                      for image_folder in os.listdir(IMAGE_DIR)]
+    deleted_image_folders = 0
+    # Deleting images with 'broken links' as well as duplicates
+    for image_folder in images_dirlist:
+        if image_folder not in valid_dirlist:
+            logging.info(f'Deleting image folder {image_folder}')
+            try:
+                shutil.rmtree(image_folder)
+            except OSError:
+                logging.error(f'Folder {image_folder} deleting failure.')
+            else:
+                deleted_image_folders += 1
+
+    logging.info(f'Total image folders deleted: {deleted_image_folders}.')
+
+# Trims the given image in order to remove "sreality.cz" watermark
+def crop_image(filename: str) -> bool:
+    image = Image.open(filename)
+    image_width, image_height = image.size
+
+    crop_left_area = CROP_LEFT * image_height
+    crop_top_area = CROP_TOP * image_width
+    if crop_left_area < crop_top_area:
+        image = image.crop((CROP_LEFT, 0, image_width, image_height))
+    else:
+        image = image.crop((0, CROP_TOP, image_width, image_height))
+
+    try:
+        image.save(filename)
+    except OSError:
+        logging.error('Can\'t save cropped image to the disk.')
+        return False
+
+    return True
+
+# Retrieves from the site and saves all the real estates photos for a given
+# item data JSON dict and hash_id
+# If use_cache is set to True, then doesn't download the image file from the
+# site in the case it has been already downloaded and saved earlier
+def save_item_images(item_json: dict, hash_id: int,
+                     use_cache: bool=False) -> bool:
+    image_folder_path = get_image_folder(get_item_link(item_json, hash_id))
+    if not os.path.exists(image_folder_path):
+        try:
+            os.mkdir(image_folder_path)
+        except OSError:
+            logging.error(f'Can\'t create images folder {image_folder_path}')
+            return False
+
+    result = True
+    for img_ind, image in enumerate(item_json['_embedded']['images']):
+        # Old version: for preview (without watermark)
+        # href = image['_links']['view']['href']
+
+        # New version: for full-sized image (with watermark)
+        href = image['_links']['self']['href']
+
+        logging.info(f'Saving image from {href}')
+        img_ind_str = str(img_ind)
+        img_ind_str = '0' * (3 - len(img_ind_str)) + img_ind_str
+        image_filename = f'{hash_id}_{img_ind_str}.jpg'
+        image_full_path = os.path.join(image_folder_path, image_filename)
+
+        # Checking if the image has already downloaded
+        if use_cache and os.path.exists(image_full_path):
+            logging.info(f'Image cache found: {image_filename}')
+        else:
+            if save_image(href, image_full_path):
+                if not crop_image(image_full_path):
+                    result = False
+            else:
+                result = False
+
+    return result
+
+# Parse real estate item hash_id from json filename
 def hash_id_from_json_name(json_filename: str) -> str:
     return int(os.path.basename(json_filename).split('.')[0])
 
-# Currently not in use
+# Parse real estate item hash_id from the particular image folder name
+# (Currently not in use)
 def hash_id_from_image_folder(image_folder: str) -> str:
     return int(image_folder.split('_')[-1])
 
+# Parse real estate item hash_id from the item URL link
 def hash_id_from_link(item_link: str) -> int:
     return int(item_link.split('/')[-1])
 
+# Generates item hash_id list from a list of prepared item dictionaries
 def get_hash_ids(items: list) -> list:
     return [hash_id_from_link(item['Ссылка']) for item in items]
 
+# Converts a real estate item URL link to a corresponding image folder name
 def get_image_folder(item_link: str) -> str:
     return os.path.join(IMAGE_DIR, item_link[len(BASE_URL):].replace('/', '_'))
 
+# Returns complete image folders list from a list of prepared item dictionaries
 def get_image_folders(items: list) -> list:
     return [get_image_folder(item_link=item['Ссылка']) for item in items]
 
+# For testing and debugging: scrapes all the JSON from API requests for each
+# real estate item in the search results
 def _scrape_raw_json():
     tor = TorProxy()
     logging.info('Starting TOR.')
@@ -609,6 +684,8 @@ def _scrape_raw_json():
 
     tor.terminate()
 
+# For testing and debugging: creates the CSV database from previously scraped
+# JSON data
 def _json_to_csv():
     filelist = glob.glob(os.path.join(JSON_DIR, '*.json'))
 
@@ -619,6 +696,8 @@ def _json_to_csv():
             item = get_item(json_data, hash_id_from_json_name(filename))
             save_item(item, CSV_FILENAME, first_item = (index == 0))
 
+# Saves "raw" JSON item data with given item hash_id
+# Filename is generated automatically
 def save_item_json(item_json: dict, hash_id: int) -> bool:
     try:
         filename = os.path.join(JSON_DIR, f'{hash_id}.json')
@@ -630,6 +709,7 @@ def save_item_json(item_json: dict, hash_id: int) -> bool:
 
     return True
 
+# Restarts TOR proxy in order to get new IP
 def restart_tor(tor: TorProxy) -> bool:
     logging.info('Re-starting TOR.')
 
@@ -647,6 +727,7 @@ def restart_tor(tor: TorProxy) -> bool:
 
     return True
 
+# Saves all the real estate item components: JSON, images and a record in CSV
 def save_item_comprehensive(hash_id: int, first_item: bool,
                             use_cache: bool=False) -> bool:
     item_json = get_item_json(hash_id)
@@ -668,6 +749,9 @@ def save_item_comprehensive(hash_id: int, first_item: bool,
 
     return True
 
+# Main scraping function: scrapes all the real estates items from the site and
+# saves the retrieved data as the CVS database, JSON files for debugging and
+# photo images
 def scrape_items(today: bool=False, use_cache: bool=False,
                  from_page: int=None) -> bool:
     if USE_TOR:
@@ -726,6 +810,7 @@ def scrape_items(today: bool=False, use_cache: bool=False,
     logging.info(f'Total added item count: {added_item_count}.')
     return True
 
+# System handler for correct CTRL-C processing
 def sigint_handler(signal_received, frame):
     logging.info('SIGINT or CTRL-C detected. Program execution halted.')
     sys.exit(0)
